@@ -1,0 +1,178 @@
+#include <iostream>
+#include <vector>
+#include <deque>
+#include <numeric>
+#include <string>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <stdio.h>
+
+#pragma comment(lib, "ws2_32.lib")
+
+constexpr size_t WINDOW_SIZE = 10;
+std::deque<int> window;
+std::vector<int> prevWindow;
+
+// Initialize Winsock
+bool initializeWinsock() {
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        std::cerr << "WSAStartup failed: " << result << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// Cleanup Winsock
+void cleanupWinsock() {
+    WSACleanup();
+}
+
+// Fetch numbers from the provided URL
+std::string getNumbersFromAPI(const std::string& host, const std::string& path) {
+    struct addrinfo hints{}, *res;
+    int sockfd;
+    std::string response;
+
+    // Set up hints and get address info
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host.c_str(), "80", &hints, &res) != 0) {
+        return "";
+    }
+
+    // Create socket and connect
+    sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sockfd == INVALID_SOCKET) {
+        freeaddrinfo(res);
+        return "";
+    }
+    if (connect(sockfd, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
+        closesocket(sockfd);
+        freeaddrinfo(res);
+        return "";
+    }
+
+    // Prepare and send the request
+    std::string request = "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n";
+    send(sockfd, request.c_str(), request.size(), 0);
+
+    // Read the response
+    char buffer[4096];
+    int bytesReceived;
+    while ((bytesReceived = recv(sockfd, buffer, sizeof(buffer), 0)) > 0) {
+        response.append(buffer, bytesReceived);
+    }
+
+    // Clean up
+    closesocket(sockfd);
+    freeaddrinfo(res);
+
+    return response;
+}
+
+// Parse the numbers from the JSON-like response
+std::vector<int> extractNumbers(const std::string& response) {
+    std::vector<int> numbers;
+    auto pos = response.find("\r\n\r\n");
+    if (pos != std::string::npos) {
+        auto jsonPart = response.substr(pos + 4);
+        auto start = jsonPart.find('[');
+        auto end = jsonPart.find(']');
+
+        if (start != std::string::npos && end != std::string::npos) {
+            std::string numbersString = jsonPart.substr(start + 1, end - start - 1);
+            size_t pos = 0;
+            while ((pos = numbersString.find(',')) != std::string::npos) {
+                numbers.push_back(std::stoi(numbersString.substr(0, pos)));
+                numbersString.erase(0, pos + 1);
+            }
+            numbers.push_back(std::stoi(numbersString));
+        }
+    }
+    return numbers;
+}
+
+// Generate the JSON response
+std::string createJsonResponse(const std::vector<int>& numbers) {
+    prevWindow = std::vector<int>(window.begin(), window.end());
+    for (int number : numbers) {
+        if (window.size() == WINDOW_SIZE) {
+            window.pop_front();
+        }
+        window.push_back(number);
+    }
+
+    double avg = 0;
+    if (!window.empty()) {
+        avg = std::accumulate(window.begin(), window.end(), 0.0) / window.size();
+    }
+
+    std::string response = "{";
+    response += "\"windowPrevState\": [" + std::accumulate(prevWindow.begin(), prevWindow.end(), std::string(),
+                  [](const std::string& a, int b) { return a + (a.length() > 0 ? "," : "") + std::to_string(b); }) + "],";
+    response += "\"windowCurrState\": [" + std::accumulate(window.begin(), window.end(), std::string(),
+                  [](const std::string& a, int b) { return a + (a.length() > 0 ? "," : "") + std::to_string(b); }) + "],";
+    response += "\"numbers\": [" + std::accumulate(numbers.begin(), numbers.end(), std::string(),
+                  [](const std::string& a, int b) { return a + (a.length() > 0 ? "," : "") + std::to_string(b); }) + "],";
+    response += "\"avg\": " + std::to_string(avg) + "}";
+
+    return response;
+}
+
+int main() {
+    if (!initializeWinsock()) {
+        return 1;
+    }
+
+    SOCKET server_fd, new_socket;
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+
+    // Set up the server socket
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(9876);
+
+    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
+    listen(server_fd, 3);
+
+    while ((new_socket = accept(server_fd, (struct sockaddr*)&address, &addrlen)) != INVALID_SOCKET) {
+        char buffer[1024] = {0};
+        recv(new_socket, buffer, 1024, 0);
+
+        std::string request(buffer);
+        std::string numberId;
+        auto pos = request.find("GET /numbers/");
+        if (pos != std::string::npos) {
+            numberId = request.substr(pos + 13, 1);
+        }
+
+        std::string host = "20.244.56.144";
+        std::string path;
+        if (numberId == "p") path = "/test/primes";
+        else if (numberId == "f") path = "/test/fibo";
+        else if (numberId == "e") path = "/test/even";
+        else if (numberId == "r") path = "/test/rand";
+        else {
+            std::string badResponse = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+            send(new_socket, badResponse.c_str(), badResponse.size(), 0);
+            closesocket(new_socket);
+            continue;
+        }
+
+        std::string apiResponse = getNumbersFromAPI(host, path);
+        auto numbers = extractNumbers(apiResponse);
+        std::string responseBody = createJsonResponse(numbers);
+
+        std::string httpResponse = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(responseBody.size()) + "\r\n\r\n" + responseBody;
+        send(new_socket, httpResponse.c_str(), httpResponse.size(), 0);
+        closesocket(new_socket);
+    }
+
+    cleanupWinsock();
+    return 0;
+}
